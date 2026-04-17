@@ -1,0 +1,299 @@
+#include <msp430.h>
+/*
+ * MSP430 Stopwatch Project
+ * Purpose: Measure the time between two digital events using interrupts and display the elapsed time on a 1602 LCD.
+ * Hardware: Button on P1.3, LED on P1.4, LCD in 4-bit mode on Port 2.
+ * Behavior: First button press starts timing, Second button press stops timing, LCD displays elapsed time in milliseconds.
+ * Design choices: Interrupt-driven button input, Timer_A interrupt used for 1 ms time base, 4-bit LCD mode used to save MSP430 pins.
+ */
+
+
+// LCD pin definitions (Port 2)
+#define RS  BIT0   // P2.0 -> LCD RS
+#define EN  BIT1   // P2.1 -> LCD E
+#define D4  BIT2   // P2.2 -> LCD D4
+#define D5  BIT3   // P2.3 -> LCD D5
+#define D6  BIT4   // P2.4 -> LCD D6
+#define D7  BIT5   // P2.5 -> LCD D7
+
+
+// Global stopwatch variables
+volatile unsigned int time_ms = 0;       // running time in milliseconds
+volatile unsigned int start_time = 0;    // timestamp of first button press
+volatile unsigned int elapsed_time = 0;  // measured time between presses
+volatile unsigned int last_press = 0;    // last accepted button press time
+volatile unsigned char started = 0;      // 0 = waiting for first press, 1 = timer running
+volatile unsigned char show_result = 0;  // flag for main loop to update LCD
+
+
+// Function prototypes
+void lcd_pulse_enable(void);
+void lcd_send_nibble(unsigned char nibble);
+void lcd_cmd(unsigned char cmd);
+void lcd_data(unsigned char data);
+void lcd_init(void);
+void lcd_clear(void);
+void lcd_set_cursor(unsigned char row, unsigned char col);
+void lcd_print(char *str);
+void lcd_print_time(unsigned int ms);
+void delay_ms(unsigned int ms);
+
+
+// Main program
+void main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
+
+
+    // Clock setup: configure DCO to 1 MHz
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+
+
+    // LED setup: P1.4 as output
+    // LED toggles each time a valid event is detected
+    P1DIR |= BIT4;
+    P1OUT &= ~BIT4;
+
+
+    // Button setup: P1.3 as input with pull-up resistor
+    // Interrupt is triggered when button is pressed
+    P1DIR &= ~BIT3;
+    P1REN |= BIT3;
+    P1OUT |= BIT3;
+    P1IE  |= BIT3;
+    P1IES |= BIT3;
+    P1IFG &= ~BIT3;
+
+
+    // LCD setup: Port 2 pins as outputs
+    P2DIR |= RS | EN | D4 | D5 | D6 | D7;
+    P2OUT &= ~(RS | EN | D4 | D5 | D6 | D7);
+
+
+    // Timer_A setup:
+    // SMCLK = 1 MHz
+    // Count to 999, so interrupt occurs every 1 ms
+    TA0CCR0 = 999;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_2 | MC_1 | TACLR;
+
+
+    // LCD startup message
+    lcd_init();
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print("Stopwatch");
+    lcd_set_cursor(1, 0);
+    lcd_print("Press button");
+
+
+    __bis_SR_register(GIE);   // Enable global interrupts
+
+
+    // Main loop:
+    // Wait for button ISR to signal that a result is ready
+    while (1)
+    {
+        if (show_result)
+        {
+            show_result = 0;
+
+
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("Elapsed time:");
+            lcd_set_cursor(1, 0);
+            lcd_print_time(elapsed_time);
+        }
+    }
+}
+
+
+// Timer_A interrupt service routine
+// Runs every 1 ms and increments stopwatch time base
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A(void)
+{
+    time_ms++;
+}
+
+
+// Port 1 interrupt service routine
+// Detects button press events on P1.3
+// First press starts timing, second press stops timing
+#pragma vector=PORT1_VECTOR
+__interrupt void Port_1(void)
+{
+    if (P1IFG & BIT3)
+    {
+        // Debounce: ignore presses within 200 ms
+        if ((time_ms - last_press) > 200)
+        {
+            last_press = time_ms;
+            P1OUT ^= BIT4;   // Toggle LED to show event detected
+
+
+            if (started == 0)
+            {
+                // First event: save start time
+                start_time = time_ms;
+                started = 1;
+
+
+                lcd_clear();
+                lcd_set_cursor(0, 0);
+                lcd_print("Timing...");
+            }
+            else
+            {
+                // Second event: calculate elapsed time
+                elapsed_time = time_ms - start_time;
+                started = 0;
+                show_result = 1;
+            }
+        }
+
+
+        P1IFG &= ~BIT3;   // Clear button interrupt flag
+    }
+}
+
+
+// LCD helper: generate enable pulse
+void lcd_pulse_enable(void)
+{
+    P2OUT |= EN;
+    __delay_cycles(1000);
+    P2OUT &= ~EN;
+    __delay_cycles(1000);
+}
+
+
+// LCD helper: send 4-bit nibble
+void lcd_send_nibble(unsigned char nibble)
+{
+    P2OUT &= ~(D4 | D5 | D6 | D7);
+
+
+    if (nibble & 0x01) P2OUT |= D4;
+    if (nibble & 0x02) P2OUT |= D5;
+    if (nibble & 0x04) P2OUT |= D6;
+    if (nibble & 0x08) P2OUT |= D7;
+
+
+    lcd_pulse_enable();
+}
+
+
+// Send command byte to LCD
+void lcd_cmd(unsigned char cmd)
+{
+    P2OUT &= ~RS;   // RS = 0 for command
+    lcd_send_nibble(cmd >> 4);
+    lcd_send_nibble(cmd & 0x0F);
+    delay_ms(2);
+}
+
+
+// Send character byte to LCD
+void lcd_data(unsigned char data)
+{
+    P2OUT |= RS;    // RS = 1 for data
+    lcd_send_nibble(data >> 4);
+    lcd_send_nibble(data & 0x0F);
+    delay_ms(2);
+}
+
+
+// LCD initialization in 4-bit mode
+void lcd_init(void)
+{
+    delay_ms(50);
+
+
+    P2OUT &= ~RS;
+
+
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x02);
+
+
+    lcd_cmd(0x28);   // 4-bit mode, 2 lines
+    lcd_cmd(0x0C);   // Display on, cursor off
+    lcd_cmd(0x06);   // Cursor moves right
+    lcd_cmd(0x01);   // Clear display
+    delay_ms(2);
+}
+
+
+// Clear LCD screen
+void lcd_clear(void)
+{
+    lcd_cmd(0x01);
+    delay_ms(2);
+}
+
+
+// Set cursor to chosen row and column: row = 0 or 1
+void lcd_set_cursor(unsigned char row, unsigned char col)
+{
+    if (row == 0)
+        lcd_cmd(0x80 + col);
+    else
+        lcd_cmd(0xC0 + col);
+}
+
+
+// Print a string to LCD
+void lcd_print(char *str)
+{
+    while (*str)
+    {
+        lcd_data(*str);
+        str++;
+    }
+}
+
+
+// Print elapsed time in milliseconds
+void lcd_print_time(unsigned int ms)
+{
+    unsigned int thousands, hundreds, tens, ones;
+
+
+    thousands = (ms / 1000) % 10;
+    hundreds  = (ms / 100) % 10;
+    tens      = (ms / 10) % 10;
+    ones      = ms % 10;
+
+
+    if (ms >= 1000)
+    {
+        lcd_data(thousands + '0');
+    }
+
+
+    lcd_data(hundreds + '0');
+    lcd_data(tens + '0');
+    lcd_data(ones + '0');
+    lcd_data(' ');
+    lcd_data('m');
+    lcd_data('s');
+}
+
+
+// Approximate delay in milliseconds for 1 MHz clock
+void delay_ms(unsigned int ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);
+    }
+}
