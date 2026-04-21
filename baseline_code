@@ -10,6 +10,7 @@
 
 // Experiment constants
 #define NUM_TRIALS 10
+#define TARGET_TIME 2500   // target time = 2.5 s
 
 // Global time base
 volatile unsigned long time_ms = 0;
@@ -38,10 +39,14 @@ unsigned int random_delay(void);
 void main(void)
 {
     unsigned int trial;
-    unsigned int reaction_time;
+    unsigned int press_time;
+    unsigned int error_time;
+    unsigned int percent_error;
     unsigned long start_time;
-    unsigned long total_time = 0;
-    unsigned int avg_time;
+    unsigned long total_error = 0;
+    unsigned long total_percent_error = 0;
+    unsigned int avg_error;
+    unsigned int avg_percent_error;
     unsigned int wait_time;
 
     WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
@@ -81,7 +86,7 @@ void main(void)
         // Start screen / instructions
         lcd_clear();
         lcd_set_cursor(0, 0);
-        lcd_print("Reaction Test");
+        lcd_print("Press at 2.5s");
         lcd_set_cursor(1, 0);
         lcd_print("Press to start");
 
@@ -91,7 +96,8 @@ void main(void)
 
         delay_ms(300);  // small pause after start press
 
-        total_time = 0;
+        total_error = 0;
+        total_percent_error = 0;
 
         // Run 10 trials
         for (trial = 1; trial <= NUM_TRIALS; trial++)
@@ -116,11 +122,22 @@ void main(void)
             P1OUT |= BIT4;
             start_time = time_ms;
 
-            // Wait for reaction button press
+            // Wait for button press at estimated 2.5 s
             while (!button_pressed);
 
-            reaction_time = (unsigned int)(time_ms - start_time);
-            total_time += reaction_time;
+            press_time = (unsigned int)(time_ms - start_time);
+
+            // Compute absolute error from 2.5 s target
+            if (press_time > TARGET_TIME)
+                error_time = press_time - TARGET_TIME;
+            else
+                error_time = TARGET_TIME - press_time;
+
+            // Compute percent error
+            percent_error = (unsigned int)((error_time * 100UL) / TARGET_TIME);
+
+            total_error += error_time;
+            total_percent_error += percent_error;
 
             // Turn LED off
             P1OUT &= ~BIT4;
@@ -130,22 +147,37 @@ void main(void)
             lcd_set_cursor(0, 0);
             lcd_print("Trial ");
             lcd_print_trial(trial);
-            lcd_print(" Time:");
+            lcd_print(" Err:");
             lcd_set_cursor(1, 0);
-            lcd_print_time(reaction_time);
+            lcd_print_time(error_time);
 
             delay_ms(1500);
         }
 
-        // Compute average
-        avg_time = (unsigned int)(total_time / NUM_TRIALS);
+        // Compute averages
+        avg_error = (unsigned int)(total_error / NUM_TRIALS);
+        avg_percent_error = (unsigned int)(total_percent_error / NUM_TRIALS);
 
-        // Show average
+        // Show average error
         lcd_clear();
         lcd_set_cursor(0, 0);
-        lcd_print("Average Time:");
+        lcd_print("Average Error:");
         lcd_set_cursor(1, 0);
-        lcd_print_time(avg_time);
+        lcd_print_time(avg_error);
+
+        delay_ms(2500);
+
+        // Show average percent error
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Avg % Error:");
+        lcd_set_cursor(1, 0);
+
+        if (avg_percent_error >= 100)
+            lcd_data((avg_percent_error / 100) + '0');
+        lcd_data(((avg_percent_error / 10) % 10) + '0');
+        lcd_data((avg_percent_error % 10) + '0');
+        lcd_data('%');
 
         delay_ms(4000);
     }
