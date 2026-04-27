@@ -1,0 +1,381 @@
+#include <msp430.h>
+
+// LCD pin definitions (Port 2)
+#define RS  BIT0   // P2.0 -> LCD RS
+#define EN  BIT1   // P2.1 -> LCD E
+#define D4  BIT2   // P2.2 -> LCD D4
+#define D5  BIT3   // P2.3 -> LCD D5
+#define D6  BIT4   // P2.4 -> LCD D6
+#define D7  BIT5   // P2.5 -> LCD D7
+
+// Experiment constants
+#define NUM_TRIALS 10
+#define TARGET_TIME 2500   // target time = 2.5 s
+
+// Global time base
+volatile unsigned long time_ms = 0;
+volatile unsigned long last_press = 0;
+
+// Button event flag
+volatile unsigned char button_pressed = 0;
+
+// Function prototypes
+void lcd_pulse_enable(void);
+void lcd_send_nibble(unsigned char nibble);
+void lcd_cmd(unsigned char cmd);
+void lcd_data(unsigned char data);
+void lcd_init(void);
+void lcd_clear(void);
+void lcd_set_cursor(unsigned char row, unsigned char col);
+void lcd_print(char *str);
+void lcd_print_time(unsigned int ms);
+void delay_ms(unsigned int ms);
+void lcd_print_trial(unsigned int trial);
+
+// Random delay helper
+unsigned int random_delay(void);
+
+// Main
+void main(void)
+{
+    unsigned int trial;
+    unsigned int press_time;
+    unsigned int error_time;
+    unsigned int percent_error;
+    unsigned long start_time;
+    unsigned long total_error = 0;
+    unsigned long total_percent_error = 0;
+    unsigned int avg_error;
+    unsigned int avg_percent_error;
+    unsigned int wait_time;
+    unsigned int restart;
+
+    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
+
+    // Clock setup: DCO = 1 MHz
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+
+    // LED setup: P1.4 output
+    P1DIR |= BIT4;
+    P1OUT &= ~BIT4;
+
+    // Button setup: P1.3 input with pull-up
+    P1DIR &= ~BIT3;
+    P1REN |= BIT3;
+    P1OUT |= BIT3;
+    P1IE  |= BIT3;
+    P1IES |= BIT3;     // interrupt on falling edge
+    P1IFG &= ~BIT3;
+
+    // LCD setup
+    P2DIR |= RS | EN | D4 | D5 | D6 | D7;
+    P2OUT &= ~(RS | EN | D4 | D5 | D6 | D7);
+
+    // Timer_A setup: 1 ms interrupt
+    TA0CCR0 = 999;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_2 | MC_1 | TACLR;
+
+    lcd_init();
+
+    __bis_SR_register(GIE);   // Enable global interrupts
+
+    while (1)
+    {
+        // reset for each full run
+        total_error = 0;
+        total_percent_error = 0;
+        restart = 0;
+
+        // Start screen / instructions
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Press at 2.5s");
+        lcd_set_cursor(1, 0);
+        lcd_print("Press to start");
+
+        // Wait for user to press button
+        button_pressed = 0;
+        while (!button_pressed);
+
+        delay_ms(300);  // small pause after start press
+
+        // Run 10 trials
+        for (trial = 1; trial <= NUM_TRIALS; trial++)
+        {
+            // Trial message
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("Trial ");
+            lcd_print_trial(trial);
+            lcd_set_cursor(1, 0);
+            lcd_print("Wait for LED...");
+            P1OUT &= ~BIT4;
+
+            // Clear old press flag
+            button_pressed = 0;
+
+            // Random delay before LED turns on
+            // Detect early press during this waiting period
+            wait_time = random_delay();
+            start_time = time_ms;
+            restart = 0;
+
+            while ((time_ms - start_time) < wait_time)
+            {
+                if (button_pressed)
+                {
+                    lcd_clear();
+                    lcd_set_cursor(0, 0);
+                    lcd_print("Too Early!");
+                    lcd_set_cursor(1, 0);
+                    lcd_print("Start Again");
+
+                    P1OUT &= ~BIT4;
+                    delay_ms(2000);
+
+                    restart = 1;
+                    break;
+                }
+            }
+
+            // Leave trials immediately if pressed too early
+            if (restart)
+            {
+                break;
+            }
+
+            // Turn LED on and begin timing
+            P1OUT |= BIT4;
+            start_time = time_ms;
+            button_pressed = 0;   // only count presses after LED turns on
+
+            // Wait for button press at estimated 2.5 s
+            while (!button_pressed);
+
+            press_time = (unsigned int)(time_ms - start_time);
+
+            // Compute absolute error from 2.5 s target
+            if (press_time > TARGET_TIME)
+                error_time = press_time - TARGET_TIME;
+            else
+                error_time = TARGET_TIME - press_time;
+
+            // Compute percent error
+            percent_error = (unsigned int)((error_time * 100UL) / TARGET_TIME);
+
+            total_error += error_time;
+            total_percent_error += percent_error;
+
+            // Turn LED off
+            P1OUT &= ~BIT4;
+
+            // Show trial result
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("Trial ");
+            lcd_print_trial(trial);
+            lcd_print(" Err:");
+            lcd_set_cursor(1, 0);
+            lcd_print_time(error_time);
+
+            delay_ms(1500);
+        }
+
+        // If user pressed too early, restart immediately
+        if (restart)
+        {
+            continue;
+        }
+
+        // Compute averages
+        avg_error = (unsigned int)(total_error / NUM_TRIALS);
+        avg_percent_error = (unsigned int)(total_percent_error / NUM_TRIALS);
+
+        // Show average error
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Average Error:");
+        lcd_set_cursor(1, 0);
+        lcd_print_time(avg_error);
+
+        delay_ms(2500);
+
+        // Show average percent error
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Avg % Error:");
+        lcd_set_cursor(1, 0);
+
+        if (avg_percent_error >= 100)
+            lcd_data((avg_percent_error / 100) + '0');
+        lcd_data(((avg_percent_error / 10) % 10) + '0');
+        lcd_data((avg_percent_error % 10) + '0');
+        lcd_data('%');
+
+        delay_ms(4000);
+    }
+}
+
+// Timer_A ISR: 1 ms time base
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A(void)
+{
+    time_ms++;
+}
+
+// Port 1 ISR: button press detection with debounce
+#pragma vector=PORT1_VECTOR
+__interrupt void Port_1(void)
+{
+    if (P1IFG & BIT3)
+    {
+        if ((time_ms - last_press) > 200)
+        {
+            last_press = time_ms;
+            button_pressed = 1;
+        }
+
+        P1IFG &= ~BIT3;
+    }
+}
+
+// Random delay: returns about 1000 to 3999 ms
+unsigned int random_delay(void)
+{
+    return 1000 + (time_ms % 3000);
+}
+
+// LCD helper: enable pulse
+void lcd_pulse_enable(void)
+{
+    P2OUT |= EN;
+    __delay_cycles(1000);
+    P2OUT &= ~EN;
+    __delay_cycles(1000);
+}
+
+// LCD helper: send nibble
+void lcd_send_nibble(unsigned char nibble)
+{
+    P2OUT &= ~(D4 | D5 | D6 | D7);
+
+    if (nibble & 0x01) P2OUT |= D4;
+    if (nibble & 0x02) P2OUT |= D5;
+    if (nibble & 0x04) P2OUT |= D6;
+    if (nibble & 0x08) P2OUT |= D7;
+
+    lcd_pulse_enable();
+}
+
+// Send LCD command
+void lcd_cmd(unsigned char cmd)
+{
+    P2OUT &= ~RS;
+    lcd_send_nibble(cmd >> 4);
+    lcd_send_nibble(cmd & 0x0F);
+    delay_ms(2);
+}
+
+// Send LCD data
+void lcd_data(unsigned char data)
+{
+    P2OUT |= RS;
+    lcd_send_nibble(data >> 4);
+    lcd_send_nibble(data & 0x0F);
+    delay_ms(2);
+}
+
+// LCD init in 4-bit mode
+void lcd_init(void)
+{
+    delay_ms(50);
+
+    P2OUT &= ~RS;
+
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x02);
+
+    lcd_cmd(0x28);   // 4-bit mode, 2 lines
+    lcd_cmd(0x0C);   // display on, cursor off
+    lcd_cmd(0x06);   // entry mode
+    lcd_cmd(0x01);   // clear
+    delay_ms(2);
+}
+
+// Clear LCD
+void lcd_clear(void)
+{
+    lcd_cmd(0x01);
+    delay_ms(2);
+}
+
+// Set cursor
+void lcd_set_cursor(unsigned char row, unsigned char col)
+{
+    if (row == 0)
+        lcd_cmd(0x80 + col);
+    else
+        lcd_cmd(0xC0 + col);
+}
+
+// Print string
+void lcd_print(char *str)
+{
+    while (*str)
+    {
+        lcd_data(*str);
+        str++;
+    }
+}
+
+// Print trial number correctly, including 10
+void lcd_print_trial(unsigned int trial)
+{
+    if (trial == 10)
+    {
+        lcd_data('1');
+        lcd_data('0');
+    }
+    else
+    {
+        lcd_data(trial + '0');
+    }
+}
+
+// Print time in ms
+void lcd_print_time(unsigned int ms)
+{
+    unsigned int thousands, hundreds, tens, ones;
+
+    thousands = (ms / 1000) % 10;
+    hundreds  = (ms / 100) % 10;
+    tens      = (ms / 10) % 10;
+    ones      = ms % 10;
+
+    if (ms >= 1000)
+        lcd_data(thousands + '0');
+
+    lcd_data(hundreds + '0');
+    lcd_data(tens + '0');
+    lcd_data(ones + '0');
+    lcd_data(' ');
+    lcd_data('m');
+    lcd_data('s');
+}
+
+// Approximate ms delay for 1 MHz clock
+void delay_ms(unsigned int ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);
+    }
+}
