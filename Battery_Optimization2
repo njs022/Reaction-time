@@ -1,0 +1,448 @@
+#include <msp430.h>
+
+// LCD pin definitions (Port 2)
+#define RS  BIT0   // P2.0 -> LCD RS
+#define EN  BIT1   // P2.1 -> LCD E
+#define D4  BIT2   // P2.2 -> LCD D4
+#define D5  BIT3   // P2.3 -> LCD D5
+#define D6  BIT4   // P2.4 -> LCD D6
+#define D7  BIT5   // P2.5 -> LCD D7
+
+// Experiment constants
+#define NUM_TRIALS 10
+
+// Global time base
+volatile unsigned long time_ms = 0;
+volatile unsigned long last_press = 0;
+
+// Button event flag
+volatile unsigned char button_pressed = 0;
+
+// Function prototypes
+void lcd_pulse_enable(void);
+void lcd_send_nibble(unsigned char nibble);
+void lcd_cmd(unsigned char cmd);
+void lcd_data(unsigned char data);
+void lcd_init(void);
+void lcd_clear(void);
+void lcd_set_cursor(unsigned char row, unsigned char col);
+void lcd_print(char *str);
+void lcd_print_time(unsigned int ms);
+void delay_ms(unsigned int ms);
+void lcd_print_trial(unsigned int trial);
+
+// Random delay helper
+unsigned int random_delay(void);
+
+////////////////////UART FUNCTIONS
+void uart_init(void);
+void uart_print(char *str);
+void uart_print_time(unsigned int ms);
+///////////////////
+
+// Main
+void main(void)
+{
+    unsigned int trial;
+    unsigned int reaction_time;
+    unsigned long start_time;
+    unsigned long total_time = 0;
+    unsigned int avg_time;
+    unsigned int wait_time;
+    unsigned int restart;
+
+    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
+
+    // Clock setup: DCO = 1 MHz
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+
+    // Disable unused peripherals to save power
+    ADC10CTL0 &= ~ENC;           // disable ADC
+    UCA0CTL1  |= UCSWRST;        // hold UART in reset until uart_init() releases it
+    P3DIR = 0xFF;                 // set unused port 3 pins to output
+    P3OUT = 0x00;                 // drive them low to prevent floating leakage
+
+    // LED setup: P1.4 output
+    P1DIR |= BIT4;
+    P1OUT &= ~BIT4;
+
+    // Button setup: P1.3 input with pull-up
+    P1DIR &= ~BIT3;
+    P1REN |= BIT3;
+    P1OUT |= BIT3;
+    P1IE  |= BIT3;
+    P1IES |= BIT3;     // interrupt on falling edge
+    P1IFG &= ~BIT3;
+
+    // LCD setup
+    P2DIR |= RS | EN | D4 | D5 | D6 | D7;
+    P2OUT &= ~(RS | EN | D4 | D5 | D6 | D7);
+
+    // Timer_A setup: 1 ms interrupt
+    TA0CCR0 = 999;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_2 | MC_1 | TACLR;
+
+    lcd_init();
+
+////////////////////UART INTITIALIZATION
+    uart_init();     // initialization for the uart process
+///////////////////
+
+    __bis_SR_register(GIE);   // Enable global interrupts
+
+    while (1)
+    {
+        // reset for each full run
+        total_time = 0;
+        restart = 0;
+
+        // Start screen / instructions
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Reaction Test");
+        lcd_set_cursor(1, 0);
+        lcd_print("Press to start");
+
+////////////////////UART START UP MESSAGE
+        uart_print("\r\n--- New Reaction Test ---\r\n");    // Gives instructional text to UI
+        uart_print("Press button to begin...\r\n");         // \r\n is necessary for Python
+///////////////////
+
+        // Wait for user to press button
+        button_pressed = 0;
+        while (!button_pressed)
+            __bis_SR_register(LPM0_bits | GIE);  // sleep; Timer_A and Port1 ISRs wake CPU
+
+        delay_ms(300);  // small pause after start press
+
+        // Run 10 trials
+        for (trial = 1; trial <= NUM_TRIALS; trial++)
+        {
+            // Trial message
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("Trial ");
+            lcd_print_trial(trial);
+            lcd_set_cursor(1, 0);
+            lcd_print("Wait for LED...");
+            P1OUT &= ~BIT4;
+
+            // Clear old press flag
+            button_pressed = 0;
+
+            // Random delay before LED turns on
+            wait_time = random_delay();
+            start_time = time_ms;
+            button_pressed = 0;
+            restart = 0;
+
+            while ((time_ms - start_time) < wait_time)
+            {
+                __bis_SR_register(LPM0_bits | GIE);  // sleep until next Timer_A tick
+
+                if (button_pressed)
+                {
+                    lcd_clear();
+                    lcd_set_cursor(0, 0);
+                    lcd_print("Too Early!");
+                    lcd_set_cursor(1, 0);
+                    lcd_print("Start Again");
+
+////////////////////UART ERROR MESSAGE
+                    uart_print("Too Early! Restarting test... \r\n");  // notifies user of early input
+///////////////////
+
+                    P1OUT &= ~BIT4;
+                    delay_ms(2000);
+
+                    restart = 1;
+                    break;
+                }
+            }
+
+            // if early press happened, leave trial loop
+            if (restart)
+            {
+                break;
+            }
+
+            // Turn LED on and begin timing
+            P1OUT |= BIT4;
+            start_time = time_ms;
+            button_pressed = 0;   // clear so only presses after LED count
+
+            // Wait for reaction button press
+            while (!button_pressed)
+                __bis_SR_register(LPM0_bits | GIE);
+
+            reaction_time = (unsigned int)(time_ms - start_time);
+            total_time += reaction_time;
+
+            // Turn LED off
+            P1OUT &= ~BIT4;
+
+            // Show trial result
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("Trial ");
+            lcd_print_trial(trial);
+            lcd_print(" Time:");
+            lcd_set_cursor(1, 0);
+            lcd_print_time(reaction_time);
+
+/////////////////// UART PRINT TRIAL RESULTS
+            uart_print("trial ");                    //prints trial results 1-10
+            while (!(IFG2 & UCA0TXIFG));                    // Polling check for data
+            UCA0TXBUF = (trial == 10 ? '1' : trial + '0');
+            if (trial == 10) {
+                while (!(IFG2 & UCA0TXIFG));
+                UCA0TXBUF = '0';
+                }
+            uart_print(" time: ");
+            uart_print_time(reaction_time);             // prints reaction time
+///////////////////
+
+            delay_ms(1500);
+        }
+
+        // if user pressed too early, restart immediately
+        if (restart)
+        {
+            continue;
+        }
+
+        // Compute average
+        avg_time = (unsigned int)(total_time / NUM_TRIALS);
+
+        // Show average
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Average Time:");
+        lcd_set_cursor(1, 0);
+        lcd_print_time(avg_time);
+
+///////////////////UART PRINTS AVERAGE TIME
+        uart_print("-------------------------\r\n");
+        uart_print("Average Time: ");
+        uart_print_time(avg_time);
+        uart_print("\r\n");
+///////////////////
+
+        delay_ms(4000);
+    }
+}
+
+// Timer_A ISR: 1 ms time base
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A(void)
+{
+    time_ms++;
+    __bic_SR_register_on_exit(LPM0_bits);  // wake main loop
+}
+
+// Port 1 ISR: button press detection with debounce
+#pragma vector=PORT1_VECTOR
+__interrupt void Port_1(void)
+{
+    if (P1IFG & BIT3)
+    {
+        if ((time_ms - last_press) > 200)
+        {
+            last_press = time_ms;
+            button_pressed = 1;
+            __bic_SR_register_on_exit(LPM0_bits);  // wake main loop
+        }
+
+        P1IFG &= ~BIT3;
+    }
+}
+
+// Random delay: returns about 1000 to 3999 ms
+unsigned int random_delay(void)
+{
+    return 1000 + (time_ms % 3000);
+}
+
+// LCD helper: enable pulse
+void lcd_pulse_enable(void)
+{
+    P2OUT |= EN;
+    __delay_cycles(1000);
+    P2OUT &= ~EN;
+    __delay_cycles(1000);
+}
+
+// LCD helper: send nibble
+void lcd_send_nibble(unsigned char nibble)
+{
+    P2OUT &= ~(D4 | D5 | D6 | D7);
+
+    if (nibble & 0x01) P2OUT |= D4;
+    if (nibble & 0x02) P2OUT |= D5;
+    if (nibble & 0x04) P2OUT |= D6;
+    if (nibble & 0x08) P2OUT |= D7;
+
+    lcd_pulse_enable();
+}
+
+// Send LCD command
+void lcd_cmd(unsigned char cmd)
+{
+    P2OUT &= ~RS;
+    lcd_send_nibble(cmd >> 4);
+    lcd_send_nibble(cmd & 0x0F);
+    delay_ms(2);
+}
+
+// Send LCD data
+void lcd_data(unsigned char data)
+{
+    P2OUT |= RS;
+    lcd_send_nibble(data >> 4);
+    lcd_send_nibble(data & 0x0F);
+    delay_ms(2);
+}
+
+// LCD init in 4-bit mode
+void lcd_init(void)
+{
+    delay_ms(50);
+
+    P2OUT &= ~RS;
+
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x03);
+    delay_ms(5);
+    lcd_send_nibble(0x02);
+
+    lcd_cmd(0x28);   // 4-bit mode, 2 lines
+    lcd_cmd(0x0C);   // display on, cursor off
+    lcd_cmd(0x06);   // entry mode
+    lcd_cmd(0x01);   // clear
+    delay_ms(2);
+}
+
+// Clear LCD
+void lcd_clear(void)
+{
+    lcd_cmd(0x01);
+    delay_ms(2);
+}
+
+// Set cursor
+void lcd_set_cursor(unsigned char row, unsigned char col)
+{
+    if (row == 0)
+        lcd_cmd(0x80 + col);
+    else
+        lcd_cmd(0xC0 + col);
+}
+
+// Print string
+void lcd_print(char *str)
+{
+    while (*str)
+    {
+        lcd_data(*str);
+        str++;
+    }
+}
+
+void lcd_print_trial(unsigned int trial)
+{
+    if (trial == 10)
+    {
+        lcd_data('1');
+        lcd_data('0');
+    }
+    else
+    {
+        lcd_data(trial + '0');
+    }
+}
+
+// Print time in ms
+void lcd_print_time(unsigned int ms)
+{
+    unsigned int thousands, hundreds, tens, ones;
+
+    thousands = (ms / 1000) % 10;
+    hundreds  = (ms / 100) % 10;
+    tens      = (ms / 10) % 10;
+    ones      = ms % 10;
+
+    if (ms >= 1000)
+        lcd_data(thousands + '0');
+
+    lcd_data(hundreds + '0');
+    lcd_data(tens + '0');
+    lcd_data(ones + '0');
+    lcd_data(' ');
+    lcd_data('m');
+    lcd_data('s');
+}
+
+// Approximate ms delay for 1 MHz clock
+void delay_ms(unsigned int ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);
+    }
+}
+
+///////////////////UART FUNCTIONALITY
+void uart_init(void)
+{
+    // Set pins 1.1 and 1.2 to RX and TX for UART communication
+    P1SEL  |= BIT1 + BIT2;
+    P1SEL2 |= BIT1 + BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;                   // use SMCLK
+
+    // for 9600 baud rate using 1MHz: 1000000/9600 = 104.16
+    UCA0BR0  = 104;                  // Low byte
+    UCA0BR1  = 0;                    // High byte
+
+    UCA0CTL1 &= ~UCSWRST;            // Stop reset
+}
+
+void uart_print(char *str)           // Print string to UART
+{
+    while(*str)
+    {
+        while (!(IFG2 & UCA0TXIFG)); // interrupt flag
+        UCA0TXBUF = *str;            // send characters to the buffer
+        str++;                       // move to next letter
+    }
+}
+
+// print time data values
+void uart_print_time(unsigned int ms)
+{
+    unsigned int thousands, hundreds, tens, ones;
+    thousands = (ms / 1000) % 10;
+    hundreds  = (ms / 100) % 10;
+    tens      = (ms / 10) % 10;
+    ones      = ms % 10;
+
+    // onyl print thousands digit if timer goes above 1000ms
+    if (ms >= 1000)
+    {
+        while (!(IFG2 & UCA0TXIFG)); UCA0TXBUF = (thousands + '0');
+    }
+    // after the buffer period print hundreds tens and ones
+    while (!(IFG2 & UCA0TXIFG)); UCA0TXBUF = (hundreds + '0');
+    while (!(IFG2 & UCA0TXIFG)); UCA0TXBUF = (tens + '0');
+    while (!(IFG2 & UCA0TXIFG)); UCA0TXBUF = (ones + '0');
+
+    uart_print(" ms\r\n"); // adds ms label
+
+}
+///////////////////
