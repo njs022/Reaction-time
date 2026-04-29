@@ -61,9 +61,6 @@ void main(void)
     // Disable unused peripherals to save power
     ADC10CTL0 &= ~ENC;           // disable ADC
     UCA0CTL1  |= UCSWRST;        // hold UART in reset until uart_init() releases it
-    P3DIR = 0xFF;                 // set unused port 3 pins to output
-    P3OUT = 0x00;                 // drive them low to prevent floating leakage
-
     // LED setup: P1.4 output
     P1DIR |= BIT4;
     P1OUT &= ~BIT4;
